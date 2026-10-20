@@ -6,6 +6,8 @@ A TUI created to manage files from SSH servers without 50 lines of code
 
 Esta es una aplicación que he creado para hacer que gestionar archivos en la terminal sea simple, lo hice principalmente para que mi mamá entienda un poco más como funcionan los servidores, así que no está muy pulido y es hecho con IA.
 Si cualquiera quiere copiar el proyecto y hacerlo mejor, bienvenido sea
+
+
 This is an app that i made to make managing files in the terminal simple, I did it mainly so that my mom understands a little more how the servers work, so it is not very polished and is vibecoded.
 If anyone wants to copy the project and make it better, welcome
 
