@@ -2,8 +2,8 @@
 # SSHManager
 A TUI created to manage files from SSH servers without 50 lines of code
 
-<img width="278" height="150" alt="SSH_Manager_2026-10-20T13_29_10_065455" src="https://github.com/user-attachments/assets/021e642f-b9ac-43ed-a5ba-de2ecec58b7b" />
 <img width="1495" height="807" alt="SSH_Manager_2026-10-20T13_28_49_906642 (1)" src="https://github.com/user-attachments/assets/ae421428-8393-43cb-8e5d-82290db8220b" />
+<img width="278" height="150" alt="SSH_Manager_2026-10-20T13_29_10_065455" src="https://github.com/user-attachments/assets/021e642f-b9ac-43ed-a5ba-de2ecec58b7b" />
 
 Esta es una aplicación que he creado para hacer que gestionar archivos en la terminal sea simple, lo hice principalmente para que mi mamá entienda un poco más como funcionan los servidores, así que no está muy pulido y es casi todo hecho con IA.
 Si cualquiera quiere copiar el proyecto y hacerlo mejor, bienvenido sea
