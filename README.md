@@ -4,11 +4,11 @@ A TUI created to manage files from SSH servers without 50 lines of code
 <img width="278" height="150" alt="SSH_Manager_2026-10-20T13_29_10_065455" src="https://github.com/user-attachments/assets/3dc43387-5849-4866-809e-54ba84fe83dc" />
 <img width="278" height="150" alt="SSH_Manager_2026-10-20T13_28_49_906642" src="https://github.com/user-attachments/assets/357bb044-0368-4f6b-a471-7f2636ed69fc" />
 
-Esta es una aplicación que he creado para hacer que gestionar archivos en la terminal sea simple, lo hice principalmente para que mi mamá entienda un poco más como funcionan los servidores, así que no está muy pulido y es hecho con IA.
+Esta es una aplicación que he creado para hacer que gestionar archivos en la terminal sea simple, lo hice principalmente para que mi mamá entienda un poco más como funcionan los servidores, así que no está muy pulido y es casi todo hecho con IA.
 Si cualquiera quiere copiar el proyecto y hacerlo mejor, bienvenido sea
 
 
-This is an app that i made to make managing files in the terminal simple, I did it mainly so that my mom understands a little more how the servers work, so it is not very polished and is vibecoded.
+This is an app that i made to make managing files in the terminal simple, I did it mainly so that my mom understands a little more how the servers work, so it is not very polished and it's vibecoded.
 If anyone wants to copy the project and make it better, welcome
 
 ## Descarga / Download
