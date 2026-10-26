@@ -1,247 +1,125 @@
 #!/usr/bin/env python3
 """
-SSH Manager — cliente SSH/SFTP con interfaz de terminal.
-Funciona igual en Windows y Linux. Sin comandos: todo con teclado o mouse.
+SSH Manager - SSH/SFTP client with a terminal interface (Windows & Linux).
+Cliente SSH/SFTP con interfaz de terminal (Windows y Linux).
 
-Dependencias:  pip install textual paramiko
-Más información:  sshmanager -h
+Dependencies are installed automatically on first run.
+Las dependencias se instalan solas la primera vez.
+Help / Ayuda:  sshmanager -h
 """
 from __future__ import annotations
 
-import codecs
-import json
 import os
 import posixpath
-import re
-import shlex
 import shutil
-import socket
-import stat
-import string
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
-import paramiko
-from rich.markup import escape
-from rich.text import Text
-from textual.app import App
-from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.css.query import NoMatches
-from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, RichLog, Static
-
-__version__ = "1.1.0"
+__version__ = "1.3.0"
 REPO_URL = "https://github.com/superc839e/sshmanager"
-UPDATE_URL = os.environ.get(
-    "SSHMANAGER_UPDATE_URL",
-    "https://raw.githubusercontent.com/superc839e/sshmanager/main/ssh_manager.py",
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+
+def _fetch_core() -> None:
+    """Si falta sshmanager_core.py junto al programa, lo descarga de GitHub."""
+    import urllib.request
+
+    es = (os.environ.get("LC_ALL") or os.environ.get("LANG") or "").lower().startswith("es")
+    print("Descargando sshmanager_core.py ..." if es else "Downloading sshmanager_core.py ...")
+    url = "https://raw.githubusercontent.com/superc839e/sshmanager/main/sshmanager_core.py"
+    last = None
+    for i in range(3):
+        try:
+            data = urllib.request.urlopen(url, timeout=10).read()
+            (HERE / "sshmanager_core.py").write_bytes(data)
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(1.5 * (i + 1))
+    print(f"ERROR: {last}")
+    sys.exit(1)
+
+
+try:
+    import sshmanager_core as core
+except ImportError:
+    _fetch_core()
+    import sshmanager_core as core
+
+from sshmanager_core import (  # noqa: E402
+    CHARS_MODES,
+    LANG_NAMES,
+    LANGS,
+    CONFIG,
+    QUEUE_FILE,
+    SETTINGS_FILE,
+    Connection,
+    LinkServer,
+    NetworkError,
+    RemoteCommand,
+    UpdateError,
+    delete_local,
+    delete_remote,
+    detect_ascii,
+    find_server,
+    gl,
+    human,
+    link_alive,
+    link_notify,
+    list_local,
+    list_remote,
+    load_queue,
+    load_servers,
+    mkdir_checked,
+    parent_local,
+    parent_remote,
+    run_queue,
+    save_queue,
+    save_servers,
+    tr,
 )
 
-# ───────────────────────── Configuración guardada ─────────────────────────
-
-
-def config_file() -> Path:
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA", Path.home()))
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return base / "sshmanager" / "servers.json"
-
-
-CONFIG = config_file()
-QUEUE_FILE = CONFIG.with_name("queue.json")
-
-
-def install_paths():
-    """Rutas que crea el instalador: (carpeta de la app, comando 'sshmanager')."""
-    if os.name == "nt":
-        local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        return local / "sshmanager", local / "Microsoft" / "WindowsApps" / "sshmanager.bat"
-    return Path.home() / ".local/share/sshmanager", Path.home() / ".local/bin/sshmanager"
-
-
-def load_servers() -> list:
-    try:
-        return json.loads(CONFIG.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-
-def save_servers(servers: list) -> None:
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.write_text(json.dumps(servers, indent=2, ensure_ascii=False), encoding="utf-8")
-    try:
-        os.chmod(CONFIG, 0o600)  # solo tu usuario puede leerlo (Linux)
-    except OSError:
-        pass
-
-
-def load_queue(key: str) -> list:
-    """Fila pendiente guardada para un servidor (user@host:puerto)."""
-    try:
-        data = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    out = []
-    for it in data.get(key, []):
-        try:
-            out.append(
-                {
-                    "id": int(it["id"]),
-                    "up": bool(it["up"]),
-                    "name": str(it["name"]),
-                    "is_dir": bool(it.get("is_dir")),
-                    "src": str(it["src"]),
-                    "dst": str(it["dst"]),
-                    "status": "error" if it.get("status") == "error" else "pendiente",
-                    "error": str(it.get("error", "")),
-                    "done": 0,
-                    "total": 0,
-                }
-            )
-        except (KeyError, TypeError, ValueError):
-            pass
-    return out
-
-
-def save_queue(key: str, items: list) -> None:
-    try:
-        data = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
-    keep = []
-    for it in items:
-        if it["status"] in ("pendiente", "en curso", "error"):
-            row = {k: it[k] for k in ("id", "up", "name", "is_dir", "src", "dst", "error")}
-            row["status"] = "error" if it["status"] == "error" else "pendiente"
-            keep.append(row)
-    if keep:
-        data[key] = keep
-    else:
-        data.pop(key, None)
-    try:
-        QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        QUEUE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass
-
-
-# ───────────────────────────── Utilidades ─────────────────────────────────
-
-
-def human(n: int) -> str:
-    n = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024 or unit == "TB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return ""
-
-
-def local_drives() -> list:
-    return [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
-
-
-class Stopped(Exception):
-    """La transferencia se detuvo a pedido del usuario."""
-
-
-class Connection:
-    """Conexión SSH + SFTP."""
-
-    def __init__(self, srv: dict, password: str | None = None):
-        self.client = paramiko.SSHClient()
-        self.client.load_system_host_keys()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.client.connect(
-            srv["host"],
-            port=int(srv.get("port") or 22),
-            username=srv["user"],
-            password=password or srv.get("password") or None,
-            key_filename=srv.get("key") or None,
-            timeout=10,
-            banner_timeout=15,
-            auth_timeout=15,
-        )
-        self.sftp = self.client.open_sftp()
-
-    def close(self) -> None:
-        try:
-            self.sftp.close()
-            self.client.close()
-        except Exception:
-            pass
-
-
-# ───────────────────── Actualizaciones (GitHub) ───────────────────────────
-
-
-class NetworkError(Exception):
-    """No se pudo llegar a GitHub."""
-
-
-class UpdateError(Exception):
-    """El archivo remoto no es válido."""
-
-
-def vtuple(v: str) -> tuple:
-    return tuple(int(x) for x in re.findall(r"\d+", v))
-
-
-def fetch_update(timeout: float = 6.0):
-    """Descarga ssh_manager.py de GitHub. Devuelve (versión_remota, código)."""
-    req = urllib.request.Request(
-        UPDATE_URL,
-        headers={"User-Agent": f"sshmanager/{__version__}", "Cache-Control": "no-cache"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read(3_000_000)
-    except urllib.error.HTTPError as e:
-        hint = " (no se encontró el archivo en GitHub)" if e.code == 404 else ""
-        raise NetworkError(f"GitHub respondió {e.code}{hint}")
-    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as e:
-        raise NetworkError(str(getattr(e, "reason", e)) or "sin conexión")
-    try:
-        src = data.decode("utf-8")
-    except UnicodeDecodeError:
-        raise UpdateError("El archivo descargado no es válido")
-    m = re.search(r'^__version__\s*=\s*"([^"]+)"', src, re.M)
-    if not m:
-        raise UpdateError("El archivo descargado no parece ser SSH Manager")
-    return m.group(1), src
-
-
-def apply_update(src: str) -> None:
-    """Reemplaza este archivo por la versión nueva (deja una copia .bak)."""
-    compile(src, "ssh_manager.py", "exec")  # valida que sea Python correcto
-    target = Path(__file__).resolve()
-    tmp = target.with_name(target.name + ".new")
-    tmp.write_text(src, encoding="utf-8")
-    try:
-        shutil.copy2(target, target.with_name(target.name + ".bak"))
-    except OSError:
-        pass
-    os.replace(tmp, target)
-
+PROJECT = core.Project("sshmanager", "superc839e/sshmanager", ["ssh_manager.py", "sshmanager_core.py"], "ssh_manager.py", HERE)
+REQS = [("textual", "textual>=0.80"), ("paramiko", "paramiko>=3.0")]
+VENV_DIR = core.install_paths()[0] / "venv"
 
 # ───────────────────────── Línea de comandos ──────────────────────────────
 
-MANUAL = f"""\
-SSH Manager v{__version__} — cliente SSH/SFTP sin comandos
+MANUAL_ES = """\
+SSH Manager v{ver} - cliente SSH/SFTP sin comandos
 
 USO
-  sshmanager          Abre la aplicación
-  sshmanager -h       Muestra este manual
-  sshmanager -v       Muestra la versión
-  sshmanager -u       Actualiza desde GitHub
-  sshmanager -d       Desinstala la aplicación
+  sshmanager                    Abre la aplicación
+  sshmanager --connect NOMBRE   Abre y conecta directo a un servidor guardado
+  sshmanager -h [es|en]         Muestra este manual (en el idioma elegido)
+  sshmanager -v                 Muestra la versión
+  sshmanager -u                 Actualiza desde GitHub (terminal y núcleo)
+  sshmanager -d                 Desinstala la aplicación
+  sshmanager -l [es|en]         Muestra o cambia el idioma
+  sshmanager --chars [auto|unicode|ascii]
+                                Muestra o cambia los caracteres de la interfaz
+  sshmanager --gui [NOMBRE]     Abre la app gráfica (opcional: en un servidor)
+  sshmanager --doctor           Diagnostica problemas comunes (Python, pip, red...)
+  sshmanager --repair           Repara las dependencias (limpia caché y reinstala)
+
+DEPENDENCIAS AUTOMÁTICAS
+  La primera vez instala solo lo que falta (textual y paramiko). Corrige solo
+  los errores comunes: Python protegido por el sistema (usa un entorno propio),
+  red inestable (reintenta), certificados, descargas dañadas, pip viejo o
+  ausente. Si no puede, explica qué hacer. Prueba --doctor y --repair.
+
+APP GRÁFICA (github.com/superc839e/sshmanagerapp)
+  Usa los mismos servidores, fila y ajustes que esta terminal. Con la tecla g
+  abres la app gráfica, y ella puede abrir esta terminal. Si ambas están
+  abiertas, se avisan al instante los cambios de servidores y de la fila.
+
+IDIOMA Y CARACTERES
+  También se cambian dentro de la app con la tecla s (Ajustes).
+  Si en Windows ves símbolos raros o bordes torcidos, usa: sshmanager --chars ascii
 
 AL ABRIR
   Busca actualizaciones en GitHub con una pantalla de carga. Si no hay
@@ -249,14 +127,14 @@ AL ABRIR
 
 LISTA DE SERVIDORES
   Enter conectar   n nuevo   e editar   x borrar
-  u buscar actualizaciones   q salir
+  u buscar actualizaciones   s ajustes   g app gráfica   q salir
 
 EXPLORACIÓN (PC a la izquierda, servidor a la derecha)
   Tab cambiar de panel      Enter abrir carpeta     Backspace subir
   t transferir ya           a añadir a la fila      f ver la fila
   c consola                 n nueva carpeta         x borrar
   r refrescar               h mostrar/ocultar ocultos
-  Esc desconectar
+  g abrir este servidor en la app gráfica           Esc desconectar
 
 FILA DE TRANSFERENCIAS
   Cada elemento recuerda su origen y su destino, aunque cambies de carpeta.
@@ -270,60 +148,134 @@ CONSOLA
   No admite programas interactivos (nano, top...). F4 cancela. Esc vuelve.
 
 ARCHIVOS
-  Servidores   {CONFIG}
-  Fila         {QUEUE_FILE}
+  Servidores   {cfg}
+  Fila         {queue}
+  Ajustes      {settings}
 
-Proyecto: {REPO_URL}
+Proyecto: {repo}
 """
+
+MANUAL_EN = """\
+SSH Manager v{ver} - SSH/SFTP client, no commands needed
+
+USAGE
+  sshmanager                    Open the application
+  sshmanager --connect NAME     Open and connect straight to a saved server
+  sshmanager -h [es|en]         Show this manual (in the chosen language)
+  sshmanager -v                 Show the version
+  sshmanager -u                 Update from GitHub (terminal and core)
+  sshmanager -d                 Uninstall the application
+  sshmanager -l [es|en]         Show or change the language
+  sshmanager --chars [auto|unicode|ascii]
+                                Show or change the interface characters
+  sshmanager --gui [NAME]       Open the graphical app (optionally on a server)
+  sshmanager --doctor           Diagnose common problems (Python, pip, network...)
+  sshmanager --repair           Repair dependencies (clear cache and reinstall)
+
+AUTOMATIC DEPENDENCIES
+  On first run it installs only what is missing (textual and paramiko). It
+  fixes the common errors by itself: system-protected Python (uses a private
+  environment), unstable network (retries), certificates, corrupted
+  downloads, old or missing pip. If it cannot, it explains what to do.
+  Try --doctor and --repair.
+
+GRAPHICAL APP (github.com/superc839e/sshmanagerapp)
+  Uses the same servers, queue and settings as this terminal. Press g to open
+  the graphical app, and it can open this terminal. If both are open they
+  notify each other instantly about changes to servers and the queue.
+
+LANGUAGE AND CHARACTERS
+  They can also be changed inside the app with the s key (Settings).
+  If you see odd symbols or crooked borders on Windows, run: sshmanager --chars ascii
+
+ON STARTUP
+  Checks GitHub for updates with a loading screen. If there is no internet
+  it flags a network error and carries on. Esc skips the check.
+
+SERVER LIST
+  Enter connect   n new   e edit   x delete
+  u check for updates   s settings   g graphical app   q quit
+
+BROWSER (PC on the left, server on the right)
+  Tab switch panel          Enter open folder       Backspace go up
+  t transfer now            a add to queue          f view queue
+  c console                 n new folder            x delete
+  r refresh                 h show/hide hidden files
+  g open this server in the graphical app           Esc disconnect
+
+TRANSFER QUEUE
+  Every item remembers its source and destination, even if you change folders.
+  If you close the app, pending items are saved for next time.
+  s start/stop   x remove   r retry failed
+  l clear finished   Esc back
+
+CONSOLE
+  Shows what the app does (connections, transfers, errors) and lets you type
+  commands to run on the server, in the folder you have open.
+  No interactive programs (nano, top...). F4 cancels. Esc goes back.
+
+FILES
+  Servers    {cfg}
+  Queue      {queue}
+  Settings   {settings}
+
+Project: {repo}
+"""
+
+
+def manual(lang: str | None = None) -> str:
+    text = MANUAL_ES if (lang or core.LANG) == "es" else MANUAL_EN
+    return text.format(ver=__version__, cfg=CONFIG, queue=QUEUE_FILE, settings=SETTINGS_FILE, repo=REPO_URL)
 
 
 def yes_no(question: str) -> bool:
     try:
-        return input(f"{question} [s/N] ").strip().lower() in ("s", "si", "sí", "y", "yes")
+        ans = input(f"{question} {tr('yn')} ").strip().lower()
     except EOFError:
         return False
+    return ans in tr("yes_words")
 
 
 def cli_update() -> int:
-    print(f"SSH Manager v{__version__} — buscando actualizaciones en GitHub…")
+    print(tr("cli_checking", cur=__version__))
     try:
-        remote, src = fetch_update()
+        remote, src = core.fetch_update(PROJECT, __version__)
     except NetworkError as e:
-        print(f"✖ Error de red: {e}")
+        print(tr("cli_net_err", e=e))
         return 1
     except UpdateError as e:
-        print(f"✖ {e}")
+        print(f"ERROR {e}")
         return 1
-    if vtuple(remote) <= vtuple(__version__):
-        print(f"✔ Ya tienes la última versión (v{__version__}).")
+    if src is None:
+        print(tr("cli_latest", cur=__version__))
         return 0
-    print(f"Nueva versión disponible: v{remote}. Instalando…")
+    print(tr("cli_new", v=remote))
     try:
-        apply_update(src)
-    except Exception as e:
-        print(f"✖ No se pudo actualizar: {e}")
+        core.apply_update(PROJECT, src)
+    except Exception as e:  # noqa: BLE001
+        print(tr("cli_update_fail", e=e))
         return 1
-    print(f"✔ Actualizado a v{remote}.")
+    print(tr("cli_updated", v=remote))
     return 0
 
 
 def cli_uninstall() -> int:
-    app_dir, launcher = install_paths()
+    app_dir, launcher = core.install_paths()
     cfg_dir = CONFIG.parent
     has_app = (app_dir / "ssh_manager.py").exists()
     has_launcher = launcher.exists()
     if not (has_app or has_launcher):
-        print("No encontré una instalación hecha con el instalador. No se borró nada.")
+        print(tr("cli_no_install"))
         return 1
-    print("Se eliminará:")
+    print(tr("cli_will_remove"))
     if has_app:
-        print(f"  • {app_dir}")
+        print(f"  - {app_dir}")
     if has_launcher:
-        print(f"  • {launcher}  (el comando sshmanager)")
-    if not yes_no("¿Desinstalar SSH Manager?"):
-        print("Cancelado.")
+        print(f"  - {launcher}  {tr('cli_cmd_note')}")
+    if not yes_no(tr("cli_ask_uninstall")):
+        print(tr("cli_cancelled"))
         return 0
-    wipe = cfg_dir.exists() and yes_no(f"¿Borrar también tus servidores guardados y la fila? ({cfg_dir})")
+    wipe = cfg_dir.exists() and yes_no(tr("cli_ask_wipe", d=cfg_dir))
     if os.name == "nt":
         # Windows no deja borrar el python que está corriendo: lo borra un proceso aparte.
         parts = ["ping -n 3 127.0.0.1 >nul"]
@@ -336,6 +288,7 @@ def cli_uninstall() -> int:
             creationflags=0x08000000 | 0x00000008,
             close_fds=True,
         )
+        print(tr("cli_win_wait"))
     else:
         if has_launcher:
             launcher.unlink()
@@ -343,77 +296,191 @@ def cli_uninstall() -> int:
             shutil.rmtree(app_dir)
     if wipe and cfg_dir.name == "sshmanager":
         shutil.rmtree(cfg_dir, ignore_errors=True)
-    print("✔ SSH Manager desinstalado." + (" Se conservaron tus servidores." if not wipe and cfg_dir.exists() else ""))
+    print(tr("cli_uninstalled") + (tr("cli_kept") if not wipe and cfg_dir.exists() else ""))
     return 0
 
 
-# ───────────────────── Planificación de transferencias ────────────────────
+def cli_lang(value: str | None) -> int:
+    if value is None:
+        print(tr("cli_lang_now", l=core.LANG))
+        return 0
+    if value not in LANGS:
+        print(tr("cli_lang_bad"))
+        return 2
+    core.apply_settings(value, core.CHARS)
+    print(tr("cli_lang_set", l=LANG_NAMES[value]))
+    return 0
 
 
-def plan_upload(local: str, remote_dir: str):
-    """Devuelve (carpetas_remotas_a_crear, [(local, remoto, tamaño)])."""
-    dirs, files = [], []
-    name = os.path.basename(local.rstrip("\\/"))
-    target = posixpath.join(remote_dir, name)
-    if os.path.isdir(local):
-        dirs.append(target)
-        for root, ds, fs in os.walk(local):
-            rel = os.path.relpath(root, local)
-            rroot = target if rel == "." else posixpath.join(target, *rel.split(os.sep))
-            for d in ds:
-                dirs.append(posixpath.join(rroot, d))
-            for f in fs:
-                lp = os.path.join(root, f)
-                files.append((lp, posixpath.join(rroot, f), os.path.getsize(lp)))
-    else:
-        files.append((local, target, os.path.getsize(local)))
-    return dirs, files
+def cli_chars(value: str | None) -> int:
+    if value is None:
+        print(tr("cli_chars_now", m=core.CHARS))
+        return 0
+    if value not in CHARS_MODES:
+        print(tr("cli_chars_bad"))
+        return 2
+    core.apply_settings(core.LANG, value)
+    print(tr("cli_chars_set", m=value))
+    return 0
 
 
-def plan_download(sftp, remote: str, local_dir: str, is_dir: bool):
-    """Devuelve (carpetas_locales_a_crear, [(remoto, local, tamaño)])."""
-    dirs, files = [], []
-    name = posixpath.basename(remote.rstrip("/"))
-    target = os.path.join(local_dir, name)
-    if is_dir:
-        stack = [(remote, target)]
-        while stack:
-            r, l = stack.pop()
-            dirs.append(l)
-            for a in sftp.listdir_attr(r):
-                rp = posixpath.join(r, a.filename)
-                lp = os.path.join(l, a.filename)
-                if stat.S_ISDIR(a.st_mode or 0):
-                    stack.append((rp, lp))
-                else:
-                    files.append((rp, lp, a.st_size or 0))
-    else:
-        files.append((remote, target, sftp.stat(remote).st_size or 0))
-    return dirs, files
+def cli_gui(name: str | None) -> int:
+    print(tr("cli_gui"))
+    ok, msg = core.launch_gui(name)
+    print(msg)
+    return 0 if ok else 1
 
 
-def remote_mkdir(sftp, path: str) -> None:
-    try:
-        sftp.mkdir(path)
-    except IOError:
-        pass  # ya existe
+def early_cli(args: list):
+    """Comandos que no necesitan la interfaz ni las dependencias. Devuelve el código de salida o None."""
+    if not args:
+        return None
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+    a = args[0]
+    arg = args[1] if len(args) > 1 else None
+    if a in ("-h", "--help"):
+        print(manual(arg if arg in LANGS else None))
+        return 0
+    if a in ("-v", "--version"):
+        print(f"SSH Manager v{__version__}")
+        return 0
+    if a in ("-u", "--update"):
+        return cli_update()
+    if a in ("-d", "--delete", "--uninstall"):
+        return cli_uninstall()
+    if a in ("-l", "--lang"):
+        return cli_lang(arg)
+    if a == "--chars":
+        return cli_chars(arg)
+    if a == "--gui":
+        return cli_gui(arg)
+    if a == "--doctor":
+        return core.doctor("SSH Manager", REQS, "gui")
+    if a == "--repair":
+        return core.repair_dependencies(REQS, VENV_DIR)
+    if a == "--install-deps":
+        already = not core.modules_missing(REQS)
+        core.ensure_dependencies(REQS, str(Path(__file__).resolve()), [], VENV_DIR)
+        if already:
+            print(tr("deps_ok"))
+        return 0
+    if a == "--connect":
+        return None  # lo maneja la interfaz
+    print(tr("cli_unknown", a=a))
+    return 2
 
 
-def remote_rmtree(sftp, path: str) -> None:
-    for a in sftp.listdir_attr(path):
-        p = posixpath.join(path, a.filename)
-        if stat.S_ISDIR(a.st_mode or 0):
-            remote_rmtree(sftp, p)
-        else:
-            sftp.remove(p)
-    sftp.rmdir(path)
+if __name__ == "__main__":
+    _args = sys.argv[1:]
+    _code = early_cli(_args)
+    if _code is not None:
+        sys.exit(_code)
+    # Instala lo que falte (con corrección de errores) antes de cargar la interfaz
+    core.ensure_dependencies(REQS, str(Path(__file__).resolve()), _args, VENV_DIR)
+
+# ───────────────────────── Interfaz (necesita textual y paramiko) ─────────
+
+import paramiko  # noqa: E402
+from rich.markup import escape  # noqa: E402
+from rich.text import Text  # noqa: E402
+from textual.app import App  # noqa: E402
+from textual.binding import Binding  # noqa: E402
+from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
+from textual.css.query import NoMatches  # noqa: E402
+from textual.screen import ModalScreen, Screen  # noqa: E402
+from textual.scrollbar import ScrollBar, ScrollBarRender  # noqa: E402
+from textual.widgets import Button, DataTable, Input, Label, RichLog, Static  # noqa: E402
+
+
+class SimpleScrollBarRender(ScrollBarRender):
+    """Barras de desplazamiento solo con bloque lleno y espacio (existen en toda fuente de Windows)."""
+
+    VERTICAL_BARS = ["█"] * 7 + [" "]
+    HORIZONTAL_BARS = ["█"] * 7 + [" "]
+
+
+def update_scrollbars() -> None:
+    simple = os.name == "nt" or core.ASCII
+    ScrollBar.renderer = SimpleScrollBarRender if simple else ScrollBarRender
+
+
+update_scrollbars()
+
+
+# ───────────────────────────── Widgets propios ────────────────────────────
+
+
+class TitleBar(Static):
+    """Barra de título (reemplaza al Header de Textual, que usa símbolos que fallan en Windows)."""
+
+    def __init__(self, sub: str = ""):
+        self.sub = sub
+        self._online = False
+        super().__init__(self._build())
+
+    def _build(self) -> Text:
+        t = Text(" SSH Manager", style="bold")
+        t.append(f" v{__version__}")
+        if self.sub:
+            t.append("  |  " + self.sub)
+        if self._online:
+            t.append("  GUI ", style="bold black on green")
+        return t
+
+    def on_mount(self):
+        self.set_link(getattr(self.app, "gui_online", False))
+
+    def set_link(self, online: bool):
+        if online != self._online:
+            self._online = online
+            self.update(self._build())
+
+
+class KeyBar(Static):
+    """Barra de atajos (reemplaza al Footer). Reparte los atajos en líneas sin partir ninguno."""
+
+    def __init__(self, items):
+        super().__init__("")
+        self.items = items
+        self._width = -1
+
+    def on_mount(self):
+        self._layout()
+
+    def on_resize(self, event):
+        self._layout()
+
+    def _layout(self):
+        width = max(self.size.width - 2, 20)
+        if width == self._width:
+            return
+        self._width = width
+        lines, cur = [], Text()
+        for key, desc in self.items:
+            chunk = Text()
+            chunk.append(f" {key} ", style="bold reverse")
+            chunk.append(f" {desc}  ")
+            if cur.cell_len and cur.cell_len + chunk.cell_len > width:
+                lines.append(cur)
+                cur = Text()
+            cur.append_text(chunk)
+        lines.append(cur)
+        self.update(Text("\n").join(lines))
+
+
+def B(keys: str, action: str) -> Binding:
+    return Binding(keys, action, "", show=False)
 
 
 # ───────────────────────────── Ventanas modales ───────────────────────────
 
 
 class Confirm(ModalScreen):
-    BINDINGS = [("escape", "no", "No")]
+    BINDINGS = [B("escape", "no")]
 
     def __init__(self, text: str):
         super().__init__()
@@ -423,8 +490,8 @@ class Confirm(ModalScreen):
         with Vertical(classes="dialog"):
             yield Label(self.text, markup=False)
             with Horizontal(classes="buttons"):
-                yield Button("Sí", variant="error", id="yes")
-                yield Button("No", id="no")
+                yield Button(tr("yes"), variant="error", id="yes")
+                yield Button(tr("no"), id="no")
 
     def on_mount(self):
         self.query_one("#no").focus()
@@ -437,7 +504,7 @@ class Confirm(ModalScreen):
 
 
 class Ask(ModalScreen):
-    BINDINGS = [("escape", "cancel", "Cancelar")]
+    BINDINGS = [B("escape", "cancel")]
 
     def __init__(self, text: str, password: bool = False):
         super().__init__()
@@ -449,8 +516,8 @@ class Ask(ModalScreen):
             yield Label(self.text, markup=False)
             yield Input(password=self.password, id="answer")
             with Horizontal(classes="buttons"):
-                yield Button("Aceptar", variant="primary", id="ok")
-                yield Button("Cancelar", id="cancel")
+                yield Button(tr("accept"), variant="primary", id="ok")
+                yield Button(tr("cancel"), id="cancel")
 
     def on_input_submitted(self, event):
         self.dismiss(event.value)
@@ -462,8 +529,63 @@ class Ask(ModalScreen):
         self.dismiss(None)
 
 
+class SettingsScreen(ModalScreen):
+    """Idioma y tipo de caracteres. Devuelve (idioma, caracteres) o None."""
+
+    BINDINGS = [B("escape", "cancel")]
+
+    def __init__(self):
+        super().__init__()
+        self.lang = core.LANG
+        self.chars = core.CHARS
+
+    def _chars_label(self) -> str:
+        label = tr("chars_" + self.chars, self.lang)
+        if self.chars == "auto":
+            label += " (" + ("ASCII" if detect_ascii("auto") else "Unicode") + ")"
+        return label
+
+    def compose(self):
+        with Vertical(classes="dialog"):
+            yield Label("", id="s_title", classes="ptitle", markup=False)
+            yield Button("", id="s_lang")
+            yield Button("", id="s_chars")
+            yield Label("", id="s_hint", markup=False)
+            with Horizontal(classes="buttons"):
+                yield Button("", variant="primary", id="s_apply")
+                yield Button("", id="s_cancel")
+
+    def on_mount(self):
+        self._refresh()
+
+    def _refresh(self):
+        L = self.lang
+        self.query_one("#s_title", Label).update(Text(tr("settings", L)))
+        self.query_one("#s_lang", Button).label = f"{tr('lang_label', L)}: {LANG_NAMES[L]}"
+        self.query_one("#s_chars", Button).label = f"{tr('chars_label', L)}: {self._chars_label()}"
+        self.query_one("#s_hint", Label).update(Text(tr("settings_hint", L)))
+        self.query_one("#s_apply", Button).label = tr("apply", L)
+        self.query_one("#s_cancel", Button).label = tr("cancel", L)
+
+    def on_button_pressed(self, event):
+        bid = event.button.id
+        if bid == "s_lang":
+            self.lang = LANGS[(LANGS.index(self.lang) + 1) % len(LANGS)]
+            self._refresh()
+        elif bid == "s_chars":
+            self.chars = CHARS_MODES[(CHARS_MODES.index(self.chars) + 1) % len(CHARS_MODES)]
+            self._refresh()
+        elif bid == "s_apply":
+            self.dismiss((self.lang, self.chars))
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
 class ServerForm(ModalScreen):
-    BINDINGS = [("escape", "cancel", "Cancelar")]
+    BINDINGS = [B("escape", "cancel")]
 
     def __init__(self, srv: dict | None = None):
         super().__init__()
@@ -472,28 +594,28 @@ class ServerForm(ModalScreen):
     def compose(self):
         s = self.srv
         with VerticalScroll(classes="dialog"):
-            yield Label("Servidor", classes="ptitle")
-            yield Label("Nombre (ej. Mi VPS)")
+            yield Label(tr("form_title"), classes="ptitle", markup=False)
+            yield Label(tr("f_name"), markup=False)
             yield Input(s.get("name", ""), id="name")
-            yield Label("Host o IP")
+            yield Label(tr("f_host"), markup=False)
             yield Input(s.get("host", ""), id="host")
-            yield Label("Puerto")
+            yield Label(tr("f_port"), markup=False)
             yield Input(str(s.get("port", 22)), id="port", type="integer")
-            yield Label("Usuario")
+            yield Label(tr("f_user"), markup=False)
             yield Input(s.get("user", ""), id="user")
-            yield Label("Contraseña (opcional)")
+            yield Label(tr("f_pass"), markup=False)
             yield Input(s.get("password", ""), id="password", password=True)
-            yield Label("Archivo de llave privada (opcional)")
+            yield Label(tr("f_key"), markup=False)
             yield Input(s.get("key", ""), id="key")
             with Horizontal(classes="buttons"):
-                yield Button("Guardar", variant="primary", id="save")
-                yield Button("Cancelar", id="cancel")
+                yield Button(tr("save"), variant="primary", id="save")
+                yield Button(tr("cancel"), id="cancel")
 
     def _save(self):
         v = {k: self.query_one(f"#{k}", Input).value.strip() for k in ("name", "host", "port", "user", "key")}
         v["password"] = self.query_one("#password", Input).value
         if not (v["name"] and v["host"] and v["user"]):
-            self.notify("Nombre, host y usuario son obligatorios", severity="error")
+            self.notify(tr("form_required"), severity="error")
             return
         v["port"] = int(v["port"] or 22)
         self.dismiss(v)
@@ -530,7 +652,7 @@ BAR_W = 28
 class SplashScreen(Screen):
     """Pantalla de carga ASCII: busca actualizaciones en GitHub."""
 
-    BINDINGS = [Binding("escape,enter,space", "skip", "Saltar", show=False)]
+    BINDINGS = [B("escape,enter,space", "skip")]
 
     def __init__(self, manual: bool = False):
         super().__init__()
@@ -542,10 +664,10 @@ class SplashScreen(Screen):
     def compose(self):
         with Vertical(id="splash"):
             yield Static(BANNER, id="banner", markup=False)
-            yield Label(f"v{__version__}", id="ver")
+            yield Label(f"v{__version__}", id="ver", markup=False)
             yield Label("", id="bar", markup=False)
-            yield Label("Buscando actualizaciones…", id="msg", markup=False)
-            yield Label("Esc: saltar", id="skiphint")
+            yield Label(tr("splash_check"), id="msg", markup=False)
+            yield Label(tr("skip_hint"), id="skiphint", markup=False)
 
     def on_mount(self):
         self.anim = self.set_interval(0.07, self._tick)
@@ -573,12 +695,12 @@ class SplashScreen(Screen):
 
     def _stop_bar(self, ok: bool):
         self.anim.stop()
-        self._set_bar("[" + ("█" if ok else "x") * (BAR_W - 2) + "]", "ok" if ok else "err")
+        self._set_bar("[" + (gl("full") if ok else "x") * (BAR_W - 2) + "]", "ok" if ok else "err")
 
     # ---- búsqueda ----
     def _check(self):
         try:
-            remote, src = fetch_update()
+            remote, src = core.fetch_update(PROJECT, __version__)
             self.app.call_from_thread(self._result, remote, src, None)
         except (NetworkError, UpdateError) as e:
             self.app.call_from_thread(self._result, None, None, e)
@@ -588,42 +710,42 @@ class SplashScreen(Screen):
     def _result(self, remote, src, err):
         app = self.app
         if err is not None:
-            kind = "Error de red" if isinstance(err, NetworkError) else "Error"
-            app.update_status = f"⚠ No se pudo buscar actualizaciones: {err}"
-            app.say(app.update_status, "red")
+            kind = tr("net_error") if isinstance(err, NetworkError) else tr("error")
+            app.update_status = ("net", str(err))
+            app.say(tr("log_net", e=err), "red")
             if self.entered:
                 return
             self._stop_bar(False)
-            self._msg(f"✖ {kind}: {err}", "err")
+            self._msg(f"{kind}: {err}", "err")
             self.set_timer(2.5, self._enter)
             return
-        if vtuple(remote) > vtuple(__version__):
-            app.update_status = f"⬆ Hay una versión nueva: v{remote}"
-            app.say(f"Versión nueva disponible: v{remote} (tienes v{__version__})", "yellow")
+        if src is not None:
+            app.update_status = ("new", remote)
+            app.say(tr("log_new", v=remote, cur=__version__), "yellow")
             if self.entered:
                 return
             self._stop_bar(True)
-            self._msg(f"Versión {remote} disponible (tienes {__version__})", "ok")
+            self._msg(tr("new_avail", v=remote, cur=__version__), "ok")
             app.push_screen(
-                Confirm(f"Hay una versión nueva ({remote}). Tienes la {__version__}.\n¿Actualizar ahora?"),
+                Confirm(tr("confirm_update", v=remote, cur=__version__)),
                 lambda yes: self._apply(remote, src) if yes else self._enter(),
             )
             return
-        app.update_status = ""
-        app.say(f"Búsqueda de actualizaciones: ya tienes la última versión (v{__version__})")
+        app.update_status = None
+        app.say(tr("log_latest", v=__version__))
         if self.entered:
             return
         self._stop_bar(True)
-        self._msg(f"✔ Estás en la última versión ({__version__})", "ok")
+        self._msg(tr("latest", v=__version__), "ok")
         self.set_timer(0.9, self._enter)
 
     def _apply(self, remote: str, src: str):
         self.updating = True
-        self._msg("Instalando actualización…")
+        self._msg(tr("installing"))
 
         def job():
             try:
-                apply_update(src)
+                core.apply_update(PROJECT, src)
                 self.app.call_from_thread(self._applied, remote, None)
             except Exception as e:
                 self.app.call_from_thread(self._applied, remote, e)
@@ -633,16 +755,13 @@ class SplashScreen(Screen):
     def _applied(self, remote: str, err):
         self.updating = False
         if err is not None:
-            self.app.say(f"No se pudo actualizar: {err}", "red")
-            self._msg(f"✖ No se pudo actualizar: {err}", "err")
+            self.app.say(tr("update_fail", e=err), "red")
+            self._msg(tr("update_fail", e=err), "err")
             self.set_timer(2.5, self._enter)
             return
-        self.app.say(f"Actualizado a v{remote}", "green")
-        self._msg(f"✔ Actualizado a v{remote}. Reiniciando…", "ok")
-        self.set_timer(
-            1.5,
-            lambda: self.app.exit(message=f"✔ SSH Manager actualizado a v{remote}. Vuelve a ejecutar: sshmanager"),
-        )
+        self.app.say(f"OK v{remote}", "green")
+        self._msg(tr("updated_restart", v=remote), "ok")
+        self.set_timer(1.5, lambda: self.app.exit(message=tr("exit_msg", v=remote)))
 
     # ---- salida ----
     def action_skip(self):
@@ -671,54 +790,21 @@ class Panel(Vertical):
         self.kind = kind
         self.conn = conn
         self.path = ""
-        self.items: list = []  # (nombre, es_carpeta, tamaño)
+        self.items: list = []  # (nombre, es_carpeta, tamaño, oculto, fecha)
         self.entries: dict = {}  # nombre -> es_carpeta
         self.show_hidden = False
 
     def compose(self):
-        yield Label("Este equipo" if self.kind == "local" else "Servidor", classes="ptitle")
+        yield Label(tr("this_pc") if self.kind == "local" else tr("server"), classes="ptitle", markup=False)
         yield Label("", id=f"path-{self.kind}", classes="ppath", markup=False)
         yield DataTable(id=self.kind, cursor_type="row", zebra_stripes=True)
 
     # ---- listado ----
     def _list(self, path: str) -> list:
-        out = []
-        if self.kind == "local":
-            if path == "":
-                return [(d, True, 0) for d in local_drives()]
-            with os.scandir(path) as it:
-                for e in it:
-                    try:
-                        d = e.is_dir()
-                        s = 0 if d else e.stat().st_size
-                    except OSError:
-                        d, s = False, 0
-                    out.append((e.name, d, s))
-        else:
-            sftp = self.conn.sftp
-            for a in sftp.listdir_attr(path):
-                m = a.st_mode or 0
-                d = stat.S_ISDIR(m)
-                if stat.S_ISLNK(m):
-                    try:
-                        d = stat.S_ISDIR(sftp.stat(posixpath.join(path, a.filename)).st_mode)
-                    except Exception:
-                        pass
-                out.append((a.filename, d, 0 if d else (a.st_size or 0)))
-        out.sort(key=lambda x: (not x[1], x[0].lower()))
-        return out
+        return list_local(path) if self.kind == "local" else list_remote(self.conn.sftp, path)
 
     def parent_path(self):
-        if self.kind == "local":
-            if self.path == "":
-                return None
-            p = Path(self.path)
-            if p.parent == p:
-                return "" if os.name == "nt" else None
-            return str(p.parent)
-        if self.path == "/":
-            return None
-        return posixpath.dirname(self.path.rstrip("/")) or "/"
+        return parent_local(self.path) if self.kind == "local" else parent_remote(self.path)
 
     def go(self, path, select=None):
         def job():
@@ -728,7 +814,7 @@ class Panel(Vertical):
                     p = self.conn.sftp.normalize(".")
                 items = self._list(p)
             except Exception as e:
-                self.app.call_from_thread(self.app.report, str(e), "error", "No se pudo abrir")
+                self.app.call_from_thread(self.app.report, str(e), "error", tr("could_not_open"))
                 return
             self.app.call_from_thread(self._fill, p, items, select)
 
@@ -747,23 +833,23 @@ class Panel(Vertical):
     def _fill(self, path, items, select):
         self.path = path
         self.items = items
-        self.entries = {n: d for n, d, _ in items}
-        self.query_one(f"#path-{self.kind}", Label).update(Text(path or "Unidades"))
+        self.entries = {it[0]: it[1] for it in items}
+        self.query_one(f"#path-{self.kind}", Label).update(Text(path or tr("drives")))
         self.render_table(select)
 
     def render_table(self, select=None):
         t = self.query_one(DataTable)
         if not t.columns:
-            t.add_column("Nombre")
-            t.add_column("Tamaño")
+            t.add_column(tr("col_name"))
+            t.add_column(tr("col_size"))
         t.clear()
         if self.parent_path() is not None:
-            t.add_row(Text("▸ .."), Text(""), key="..")
-        for n, d, s in self.items:
-            if n.startswith(".") and not self.show_hidden:
+            t.add_row(Text(gl("dir") + ".."), Text(""), key="..")
+        for n, d, s, hidden, _mtime in self.items:
+            if hidden and not self.show_hidden:
                 continue
             if d:
-                t.add_row(Text("▸ " + n, style="bold cyan"), Text(""), key=n)
+                t.add_row(Text(gl("dir") + n, style="bold cyan"), Text(""), key=n)
             else:
                 t.add_row(Text("  " + n), Text(human(s), justify="right"), key=n)
         if select is not None:
@@ -791,78 +877,58 @@ class Panel(Vertical):
                 self.go(posixpath.join(self.path, name))
 
     # ---- operaciones ----
+    def _where(self) -> str:
+        return tr("pc") if self.kind == "local" else tr("server")
+
     def _op(self, fn, okmsg: str):
         def job():
             try:
                 fn()
                 self.app.call_from_thread(self.app.say, okmsg)
             except Exception as e:
-                self.app.call_from_thread(self.app.report, str(e), "error", "Error")
+                self.app.call_from_thread(self.app.report, str(e), "error", tr("error"))
             self.app.call_from_thread(self.reload)
 
         self.run_worker(job, thread=True, group="ops")
 
     def mkdir(self, name: str):
         def fn():
-            if "/" in name or "\\" in name:
-                raise ValueError("Nombre de carpeta inválido")
+            mkdir_checked(name)
             if self.kind == "local":
                 os.makedirs(os.path.join(self.path, name), exist_ok=True)
             else:
                 self.conn.sftp.mkdir(posixpath.join(self.path, name))
 
-        where = "PC" if self.kind == "local" else "Servidor"
-        self._op(fn, f"Carpeta creada en {where}: {name}")
+        self._op(fn, tr("log_mkdir", where=self._where(), name=name))
 
     def delete(self, name: str):
         def fn():
             if self.kind == "local":
-                p = os.path.join(self.path, name)
-                if os.path.isdir(p) and not os.path.islink(p):
-                    shutil.rmtree(p)
-                else:
-                    os.remove(p)
+                delete_local(os.path.join(self.path, name))
             else:
-                sftp = self.conn.sftp
-                p = posixpath.join(self.path, name)
-                if stat.S_ISDIR(sftp.lstat(p).st_mode or 0):
-                    remote_rmtree(sftp, p)
-                else:
-                    sftp.remove(p)
+                delete_remote(self.conn.sftp, posixpath.join(self.path, name))
 
-        where = "PC" if self.kind == "local" else "Servidor"
-        self._op(fn, f"Borrado en {where}: {name}")
+        self._op(fn, tr("log_deleted", where=self._where(), name=name))
 
 
 # ───────────────────────────── Pantalla: consola ──────────────────────────
 
-ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
 
 class ConsoleScreen(Screen):
-    BINDINGS = [
-        Binding("escape", "back", "Volver"),
-        Binding("f4", "cancel", "Cancelar comando"),
-        Binding("ctrl+l", "clear", "Limpiar"),
-    ]
+    BINDINGS = [B("escape", "back"), B("f4", "cancel"), B("ctrl+l", "clear")]
 
     def __init__(self, browser: "BrowserScreen"):
         super().__init__()
         self.browser = browser
-        self.chan = None
+        self.cmd = None
         self.running = False
-        self.cancelled = False
 
     def compose(self):
-        yield Header()
-        yield Label(
-            "Consola — eventos de la app y comandos en el servidor (sin programas interactivos como nano o top)",
-            id="hint",
-            markup=False,
-        )
+        yield TitleBar(tr("k_console"))
+        yield Label(tr("console_title"), id="hint", markup=False)
         yield RichLog(id="log", wrap=True, highlight=False, markup=False, max_lines=2000)
-        yield Input(placeholder="Comando para ejecutar en el servidor y Enter…", id="cmd")
-        yield Footer()
+        yield Input(placeholder=tr("console_placeholder"), id="cmd")
+        yield KeyBar([("F4", tr("k_cancel_cmd")), ("Ctrl+L", tr("k_clear")), ("Esc", tr("back"))])
 
     def on_mount(self):
         for line in self.app.console_buffer:
@@ -882,96 +948,46 @@ class ConsoleScreen(Screen):
         self.app.pop_screen()
 
     def action_cancel(self):
-        if self.running and self.chan is not None:
-            self.cancelled = True
-            try:
-                self.chan.close()
-            except Exception:
-                pass
+        if self.running and self.cmd is not None:
+            self.cmd.cancel()
 
     def on_input_submitted(self, event):
-        cmd = event.value.strip()
+        text = event.value.strip()
         event.input.value = ""
-        if not cmd:
+        if not text:
             return
         if self.running:
-            self.notify("Ya hay un comando en ejecución (F4 para cancelar)", severity="warning")
+            self.notify(tr("cmd_running"), severity="warning")
             return
-        cwd = self.browser.panel("remote").path
         self.running = True
-        self.cancelled = False
-        self.app.say(f"$ {cmd}", "bold green")
-        self.run_worker(lambda: self._exec(cmd, cwd), thread=True, group="cmd")
+        self.cmd = RemoteCommand(self.browser.conn, text, self.browser.panel("remote").path)
+        self.app.say(f"$ {text}", "bold green")
+        self.run_worker(self._exec, thread=True, group="cmd")
 
-    def _emit(self, lines, style=""):
-        if lines:
+    def _exec(self):
+        def emit(lines, style):
             self.app.call_from_thread(self.app.say_many, lines, style)
 
-    def _exec(self, cmd: str, cwd: str):
-        code = None
-        try:
-            # En servidores Windows (rutas tipo /C:/...) no se usa 'cd'.
-            if not cwd or re.match(r"^/[A-Za-z]:", cwd):
-                full = cmd
-            else:
-                full = f"cd {shlex.quote(cwd)} && {cmd}"
-            chan = self.browser.conn.client.get_transport().open_session()
-            self.chan = chan
-            chan.set_combine_stderr(True)
-            chan.exec_command(full)
-            chan.shutdown_write()  # el comando no queda esperando teclado
-            dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            pend = ""
-            while True:
-                if chan.recv_ready():
-                    data = chan.recv(8192)
-                    if not data:
-                        break
-                    pend += dec.decode(data)
-                    pend = ANSI.sub("", pend).replace("\r\n", "\n").replace("\r", "\n")
-                    *lines, pend = pend.split("\n")
-                    self._emit(lines)
-                elif chan.exit_status_ready() or chan.closed:
-                    if chan.recv_ready():
-                        continue
-                    break
-                else:
-                    time.sleep(0.05)
-            if pend:
-                self._emit([pend])
-            if chan.exit_status_ready():
-                code = chan.recv_exit_status()
-            chan.close()
-        except Exception as e:
-            self._emit([f"Error: {e}"], "red")
-        if self.cancelled:
-            self._emit(["(comando cancelado)"], "yellow")
-        elif code is not None:
-            self._emit([f"[código de salida: {code}]"], "dim" if code == 0 else "red")
+        self.cmd.run(emit)
         self.app.call_from_thread(self._finished)
 
     def _finished(self):
         self.running = False
-        self.chan = None
 
 
 # ───────────────────────────── Pantalla: fila ─────────────────────────────
 
-STATUS_STYLE = {
-    "pendiente": ("… pendiente", "yellow"),
-    "en curso": ("▶ en curso", "bold cyan"),
-    "listo": ("✔ listo", "green"),
-    "error": ("✖ error", "bold red"),
-}
+STATUS_KEY = {"pendiente": "s_pending", "en curso": "s_running", "listo": "s_done", "error": "s_error"}
+STATUS_COLOR = {"pendiente": "yellow", "en curso": "bold cyan", "listo": "green", "error": "bold red"}
 
 
 class QueueScreen(Screen):
     BINDINGS = [
-        Binding("s", "toggle", "Iniciar/Detener"),
-        Binding("x,delete", "remove", "Quitar"),
-        Binding("r", "retry", "Reintentar fallidos"),
-        Binding("l", "clear", "Limpiar terminados"),
-        Binding("escape,q", "back", "Volver"),
+        B("s", "toggle"),
+        B("x,delete", "remove"),
+        B("r", "retry"),
+        B("l", "clear"),
+        B("escape,q", "back"),
     ]
 
     def __init__(self, browser: "BrowserScreen"):
@@ -979,16 +995,24 @@ class QueueScreen(Screen):
         self.browser = browser
 
     def compose(self):
-        yield Header()
-        yield Label("Fila de transferencias — cada elemento recuerda de dónde viene y a dónde va", id="hint", markup=False)
+        yield TitleBar(tr("queue_name"))
+        yield Label(tr("queue_title"), id="hint", markup=False)
         yield DataTable(id="qtable", cursor_type="row", zebra_stripes=True)
         yield Label("", id="status", markup=False)
-        yield Footer()
+        yield KeyBar(
+            [
+                ("s", tr("k_startstop")),
+                ("x", tr("k_remove")),
+                ("r", tr("k_retry")),
+                ("l", tr("k_clear_done")),
+                ("Esc", tr("back")),
+            ]
+        )
 
     def on_mount(self):
         t = self.query_one(DataTable)
-        for c in ("Estado", "Tipo", "Nombre", "Origen", "Destino", "Avance"):
-            t.add_column(c)
+        for c in ("col_status", "col_type", "col_name", "col_from", "col_to", "col_progress"):
+            t.add_column(tr(c))
         self.refresh_rows()
         t.focus()
 
@@ -1004,7 +1028,6 @@ class QueueScreen(Screen):
         t.clear()
         q = self.browser.queue
         for it in q:
-            label, style = STATUS_STYLE[it["status"]]
             up = it["up"]
             if it["status"] == "error":
                 prog = it["error"][:60]
@@ -1013,11 +1036,11 @@ class QueueScreen(Screen):
             else:
                 prog = ""
             t.add_row(
-                Text(label, style=style),
-                Text("↑ Subir" if up else "↓ Bajar"),
-                Text(("▸ " if it["is_dir"] else "") + it["name"]),
-                Text(("PC: " if up else "Servidor: ") + it["src"]),
-                Text(("Servidor: " if up else "PC: ") + it["dst"]),
+                Text(tr(STATUS_KEY[it["status"]]), style=STATUS_COLOR[it["status"]]),
+                Text((gl("up") + " " + tr("t_up")) if up else (gl("down") + " " + tr("t_down"))),
+                Text((gl("dir") if it["is_dir"] else "") + it["name"]),
+                Text((tr("pc") if up else tr("server")) + ": " + it["src"]),
+                Text((tr("server") if up else tr("pc")) + ": " + it["dst"]),
                 Text(prog),
                 key=str(it["id"]),
             )
@@ -1028,9 +1051,11 @@ class QueueScreen(Screen):
                 pass
         n = lambda s: sum(1 for i in q if i["status"] == s)
         if q:
-            summary = f'{n("pendiente")} pendiente(s) · {n("en curso")} en curso · {n("listo")} listo(s) · {n("error")} con error'
+            summary = tr(
+                "queue_summary", p=n("pendiente"), r=n("en curso"), d=n("listo"), e=n("error")
+            )
         else:
-            summary = "La fila está vacía. En la exploración usa 'a' para añadir lo seleccionado."
+            summary = tr("queue_empty")
         self.query_one("#status", Label).update(Text(summary))
 
     def _item(self):
@@ -1045,7 +1070,7 @@ class QueueScreen(Screen):
         if it is None:
             return
         if it["status"] == "en curso":
-            self.notify("Detén la fila antes de quitar un elemento en curso", severity="warning")
+            self.notify(tr("rm_running"), severity="warning")
             return
         self.browser.queue.remove(it)
         self.browser.queue_changed()
@@ -1057,7 +1082,7 @@ class QueueScreen(Screen):
                 it["status"], it["error"] = "pendiente", ""
                 n += 1
         self.browser.queue_changed()
-        self.notify(f"{n} elemento(s) vuelven a pendiente" if n else "No hay elementos con error")
+        self.notify(tr("retry_n", n=n) if n else tr("retry_none"))
 
     def action_clear(self):
         self.browser.queue[:] = [i for i in self.browser.queue if i["status"] != "listo"]
@@ -1070,19 +1095,36 @@ class QueueScreen(Screen):
 # ───────────────────────── Pantalla de exploración ────────────────────────
 
 
+class _TuiHooks:
+    """Pasa lo que informa el motor de transferencias (hilo aparte) al hilo de la interfaz."""
+
+    def __init__(self, scr):
+        self.scr = scr
+
+    def item_update(self, it, status):
+        self.scr._ui(self.scr._item_update, it, status)
+
+    def tick(self, it, label):
+        self.scr._ui(self.scr._tick, it, label)
+
+    def done(self, ok, err, msg):
+        self.scr._ui(self.scr._queue_done, ok, err, msg)
+
+
 class BrowserScreen(Screen):
     BINDINGS = [
-        Binding("tab", "swap", "Cambiar panel"),
-        Binding("t,f5", "transfer", "Transferir ya"),
-        Binding("a", "enqueue", "A la fila"),
-        Binding("f", "show_queue", "Ver fila"),
-        Binding("c", "console", "Consola"),
-        Binding("n", "mkdir", "Nueva carpeta"),
-        Binding("x,delete", "delete", "Borrar"),
-        Binding("r", "refresh", "Refrescar"),
-        Binding("h", "hidden", "Ocultos"),
-        Binding("backspace", "up", "Subir", show=False),
-        Binding("escape,q", "disconnect", "Desconectar"),
+        B("tab", "swap"),
+        B("t,f5", "transfer"),
+        B("a", "enqueue"),
+        B("f", "show_queue"),
+        B("c", "console"),
+        B("n", "mkdir"),
+        B("x,delete", "delete"),
+        B("r", "refresh"),
+        B("h", "hidden"),
+        B("backspace", "up"),
+        B("g", "gui"),
+        B("escape,q", "disconnect"),
     ]
 
     def __init__(self, conn: Connection, title: str, srv: dict):
@@ -1096,18 +1138,33 @@ class BrowserScreen(Screen):
         self.busy = False
 
     def compose(self):
-        yield Header()
+        yield TitleBar(self.srv_title)
         with Horizontal(id="panels"):
             yield Panel("local", self.conn)
             yield Panel("remote", self.conn)
         yield Label("", id="status", markup=False)
-        yield Footer()
+        yield KeyBar(
+            [
+                ("Tab", tr("k_panel")),
+                ("Enter", tr("k_open")),
+                ("t", tr("k_transfer")),
+                ("a", tr("k_addq")),
+                ("f", tr("k_queue")),
+                ("c", tr("k_console")),
+                ("n", tr("k_mkdir")),
+                ("x", tr("k_delete")),
+                ("r", tr("k_refresh")),
+                ("h", tr("k_hidden")),
+                ("g", tr("k_gui")),
+                ("Esc", tr("k_disconnect")),
+            ]
+        )
 
     def on_mount(self):
-        self.app.sub_title = self.srv_title
+        self.app.current_server = self.srv_title
         self.set_status(self.idle_status())
         if self.queue:
-            msg = f"Se restauró la fila de este servidor: {len(self.queue)} elemento(s) pendiente(s) (f para verla)"
+            msg = tr("queue_restored", n=len(self.queue))
             self.app.say(msg)
             self.notify(msg)
         self.call_after_refresh(self._start)
@@ -1140,8 +1197,7 @@ class BrowserScreen(Screen):
 
     def idle_status(self) -> str:
         n = sum(1 for i in self.queue if i["status"] in ("pendiente", "error"))
-        base = "Tab: cambiar panel · Enter: abrir · t: transferir ya · a: a la fila · c: consola"
-        return base + (f" · Fila: {n} pendiente(s) (f)" if n else "")
+        return tr("queue_n", n=n) if n else tr("ready")
 
     def _ui(self, fn, *args):
         self.app.call_from_thread(fn, *args)
@@ -1169,10 +1225,10 @@ class BrowserScreen(Screen):
     def action_mkdir(self):
         p = self.active()
         if p.path == "":
-            self.notify("Entra primero a una unidad", severity="warning")
+            self.notify(tr("open_drive"), severity="warning")
             return
         self.app.push_screen(
-            Ask("Nombre de la nueva carpeta:"),
+            Ask(tr("mkdir_prompt")),
             lambda v: p.mkdir(v.strip()) if v and v.strip() else None,
         )
 
@@ -1181,10 +1237,10 @@ class BrowserScreen(Screen):
         name = self.selected(p)
         if name is None:
             return
-        donde = "este equipo" if p.kind == "local" else "el servidor"
-        extra = " y todo su contenido" if p.entries.get(name) else ""
+        where = tr("where_local") if p.kind == "local" else tr("where_remote")
+        extra = tr("extra_contents") if p.entries.get(name) else ""
         self.app.push_screen(
-            Confirm(f"¿Borrar '{name}'{extra} de {donde}? No se puede deshacer."),
+            Confirm(tr("confirm_delete", name=name, extra=extra, where=where)),
             lambda ok: p.delete(name) if ok else None,
         )
 
@@ -1196,24 +1252,45 @@ class BrowserScreen(Screen):
 
     def action_disconnect(self):
         if self.busy:
-            self.notify("Espera a que termine la fila (o detenla desde 'f')", severity="warning")
+            self.notify(tr("busy_leave"), severity="warning")
             return
         pend = sum(1 for i in self.queue if i["status"] in ("pendiente", "error"))
         self.conn.close()
-        self.app.say(f"Desconectado de {self.srv_title}")
+        self.app.say(tr("log_disconnected", name=self.srv_title))
+        self.app.current_server = None
         if pend:
-            self.app.notify(f"La fila quedó guardada: {pend} elemento(s) pendiente(s)")
-        self.app.sub_title = ""
+            self.app.notify(tr("queue_saved", n=pend))
         self.app.pop_screen()
 
     # ---- fila de transferencias ----
     def describe(self, it: dict) -> str:
         up = it["up"]
-        a, b = ("PC", "Servidor") if up else ("Servidor", "PC")
-        return f'{"↑" if up else "↓"} {it["name"]}  ({a}: {it["src"]} → {b}: {it["dst"]})'
+        a, b = (tr("pc"), tr("server")) if up else (tr("server"), tr("pc"))
+        return f'{gl("up") if up else gl("down")} {it["name"]}  ({a}: {it["src"]} {gl("arrow")} {b}: {it["dst"]})'
 
     def queue_save(self):
         save_queue(self.qkey, self.queue)
+        link_notify("gui", {"cmd": "queue_changed", "key": self.qkey})
+
+    def queue_reload(self):
+        """La app gráfica cambió la fila de este servidor: se vuelve a leer del disco."""
+        if self.busy:
+            return
+        fresh = load_queue(self.qkey)
+        keep = [i for i in self.queue if i["status"] == "listo"]
+        used = {i["id"] for i in keep}
+        nid = max(used, default=0) + 1
+        for it in fresh:
+            if it["id"] in used:
+                it["id"], nid = nid, nid + 1
+            used.add(it["id"])
+        self.queue[:] = keep + fresh
+        self.next_id = max(used, default=0) + 1
+        self.queue_refresh()
+        self.app.say(tr("link_queue"))
+
+    def action_gui(self):
+        self.app.open_gui(self.srv_title)
 
     def queue_refresh(self):
         for scr in list(self.app.screen_stack):
@@ -1236,10 +1313,10 @@ class BrowserScreen(Screen):
         src, dst = self.active(), self.other()
         name = self.selected(src)
         if name is None:
-            self.notify("Selecciona un archivo o carpeta primero", severity="warning")
+            self.notify(tr("select_first"), severity="warning")
             return None
         if src.path == "" or dst.path == "":
-            self.notify("Entra a una carpeta (no a la lista de unidades)", severity="warning")
+            self.notify(tr("open_folder"), severity="warning")
             return None
         item = {
             "id": 0,
@@ -1260,9 +1337,9 @@ class BrowserScreen(Screen):
         self.next_id += 1
         self.queue.append(item)
         self.queue_changed()
-        self.app.say(f"Fila: añadido {self.describe(item)}")
+        self.app.say(tr("log_added", desc=self.describe(item)))
         if not quiet:
-            self.notify(f"Añadido a la fila: {item['name']}")
+            self.notify(tr("added_notify", name=item["name"]))
 
     def action_enqueue(self):
         v = self._validate()
@@ -1271,11 +1348,11 @@ class BrowserScreen(Screen):
         item, exists = v
         sig = lambda i: (i["up"], i["name"], i["src"], i["dst"])
         if any(sig(i) == sig(item) and i["status"] in ("pendiente", "error") for i in self.queue):
-            self.notify("Ya está en la fila con el mismo origen y destino", severity="warning")
+            self.notify(tr("already_queued"), severity="warning")
             return
         if exists:
             self.app.push_screen(
-                Confirm(f"'{item['name']}' ya existe en el destino y se sobrescribirá al ejecutar la fila. ¿Añadir igual?"),
+                Confirm(tr("overwrite_queue", name=item["name"])),
                 lambda ok: self._add(item) if ok else None,
             )
         else:
@@ -1288,7 +1365,7 @@ class BrowserScreen(Screen):
         item, exists = v
         if exists:
             self.app.push_screen(
-                Confirm(f"'{item['name']}' ya existe en el destino. ¿Sobrescribir?"),
+                Confirm(tr("overwrite", name=item["name"])),
                 lambda ok: self._now(item) if ok else None,
             )
         else:
@@ -1297,18 +1374,18 @@ class BrowserScreen(Screen):
     def _now(self, item: dict):
         self._add(item, quiet=True)
         if self.busy:
-            self.notify("Hay una transferencia en curso: quedó en la fila", severity="warning")
+            self.notify(tr("queued_busy"), severity="warning")
             return
         self.run_items([item["id"]])
 
     def toggle_queue(self):
         if self.busy:
             self.stop.set()
-            self.notify("Deteniendo la fila…")
+            self.notify(tr("stopping"))
             return
         ids = [i["id"] for i in self.queue if i["status"] == "pendiente"]
         if not ids:
-            self.notify("La fila no tiene elementos pendientes", severity="warning")
+            self.notify(tr("nothing_pending"), severity="warning")
             return
         self.run_items(ids)
 
@@ -1317,88 +1394,19 @@ class BrowserScreen(Screen):
             return
         self.busy = True
         self.stop.clear()
-        self.set_status("Iniciando…")
+        self.set_status(tr("starting"))
         self.run_worker(lambda: self._run(ids), thread=True, group="transfer")
 
     # ---- ejecución (hilo aparte) ----
     def _run(self, ids: list):
-        ok = err = 0
-        try:
-            sftp = self.conn.client.open_sftp()  # canal propio, no choca con la navegación
-        except Exception as e:
-            self._ui(self._queue_done, 0, 0, f"No se pudo abrir un canal SFTP: {e}")
-            return
-        try:
-            for i in ids:
-                if self.stop.is_set():
-                    break
-                it = next((x for x in self.queue if x["id"] == i), None)
-                if it is None or it["status"] != "pendiente":
-                    continue
-                self._ui(self._item_update, it, "en curso")
-                try:
-                    self._transfer(sftp, it)
-                    self._ui(self._item_update, it, "listo")
-                    ok += 1
-                except Stopped:
-                    self._ui(self._item_update, it, "pendiente")
-                    break
-                except Exception as e:
-                    it["error"] = str(e) or type(e).__name__
-                    self._ui(self._item_update, it, "error")
-                    err += 1
-        finally:
-            try:
-                sftp.close()
-            except Exception:
-                pass
-        self._ui(self._queue_done, ok, err, None)
-
-    def _transfer(self, sftp, it: dict):
-        up, name, sp, dp = it["up"], it["name"], it["src"], it["dst"]
-        if up:
-            dirs, files = plan_upload(os.path.join(sp, name), dp)
-            for d in dirs:
-                remote_mkdir(sftp, d)
-        else:
-            dirs, files = plan_download(sftp, posixpath.join(sp, name), dp, it["is_dir"])
-            for d in dirs:
-                os.makedirs(d, exist_ok=True)
-        total = sum(f[2] for f in files)
-        denom = total or 1
-        it["total"], it["done"] = denom, 0
-        done = 0
-        last = [0.0]
-        for s, d, size in files:
-            label = os.path.basename(s)
-
-            def cb(sent, _total, base=done, label=label):
-                if self.stop.is_set():
-                    raise Stopped()
-                it["done"] = base + sent
-                now = time.monotonic()
-                if now - last[0] > 0.1:
-                    last[0] = now
-                    self._ui(self._tick, it, label)
-
-            if self.stop.is_set():
-                raise Stopped()
-            if up:
-                sftp.put(s, d, callback=cb)
-            else:
-                sftp.get(s, d, callback=cb)
-            done += size
-            it["done"] = done
-            self._ui(self._tick, it, label)
-        it["done"] = denom
-        it["total"] = denom
+        run_queue(self.conn, self.queue, ids, self.stop, _TuiHooks(self))
 
     # ---- actualizaciones de interfaz (hilo principal) ----
     def _tick(self, it: dict, label: str):
         frac = min(it["done"] / (it["total"] or 1), 1.0)
         n = int(frac * 20)
-        bar = "█" * n + "░" * (20 - n)
-        arrow = "↑" if it["up"] else "↓"
+        bar = gl("full") * n + gl("empty") * (20 - n)
+        arrow = gl("up") if it["up"] else gl("down")
         self.set_status(f"{arrow} {label}  {bar} {frac:4.0%}  {human(it['done'])} / {human(it['total'])}")
         for scr in list(self.app.screen_stack):
             if isinstance(scr, QueueScreen):
@@ -1412,25 +1420,23 @@ class BrowserScreen(Screen):
         d = self.describe(it)
         if status == "en curso":
             it["error"] = ""
-            self.app.say(f"▶ {d}")
+            self.app.say(tr("log_item_start", d=d))
         elif status == "listo":
-            self.app.say(f"✔ {d}", "green")
+            self.app.say(tr("log_item_ok", d=d), "green")
         elif status == "error":
-            self.app.say(f"✖ {d}: {it['error']}", "red")
-            self.notify(escape(it["error"]), title=f"Error: {it['name']}", severity="error")
+            self.app.say(tr("log_item_err", d=d, e=it["error"]), "red")
+            self.notify(escape(it["error"]), title=tr("err_title", name=it["name"]), severity="error")
         elif status == "pendiente":
-            self.app.say(f"⏸ Detenido: {d}", "yellow")
+            self.app.say(tr("log_item_stop", d=d), "yellow")
         self.queue_changed()
 
     def _queue_done(self, ok: int, err: int, msg):
         self.busy = False
-        stopped = self.stop.is_set()
+        failed = msg is not None
         if msg is None:
-            msg = f"Fila terminada: {ok} lista(s), {err} con error"
-            if stopped:
-                msg = f"Fila detenida: {ok} lista(s), {err} con error"
-        self.app.report(msg, "error" if err or msg.startswith("No se pudo") else "information")
-        self.set_status(("✖ " if err else "✔ ") + msg)
+            msg = tr("queue_stopped" if self.stop.is_set() else "queue_finished", ok=ok, err=err)
+        self.app.report(msg, "error" if err or failed else "information")
+        self.set_status(("ERROR  " if err or failed else "OK  ") + msg)
         self.panel("local").reload()
         self.panel("remote").reload()
         self.queue_refresh()
@@ -1441,11 +1447,13 @@ class BrowserScreen(Screen):
 
 class ServersScreen(Screen):
     BINDINGS = [
-        Binding("n", "new", "Nuevo"),
-        Binding("e", "edit", "Editar"),
-        Binding("x,delete", "remove", "Borrar"),
-        Binding("u", "update", "Actualizaciones"),
-        Binding("q", "app.quit", "Salir"),
+        B("n", "new"),
+        B("e", "edit"),
+        B("x,delete", "remove"),
+        B("u", "update"),
+        B("s", "settings"),
+        B("g", "gui"),
+        B("q", "app.quit"),
     ]
 
     def __init__(self):
@@ -1454,20 +1462,50 @@ class ServersScreen(Screen):
         self.connecting = False
 
     def compose(self):
-        yield Header()
+        yield TitleBar()
         yield Label("", id="hint", markup=False)
         yield Label("", id="net", markup=False)
         yield DataTable(cursor_type="row", zebra_stripes=True)
-        yield Footer()
+        yield KeyBar(
+            [
+                ("Enter", tr("k_connect")),
+                ("n", tr("k_new")),
+                ("e", tr("k_edit")),
+                ("x", tr("k_delete")),
+                ("u", tr("k_update")),
+                ("s", tr("k_settings")),
+                ("g", tr("k_gui")),
+                ("q", tr("k_quit")),
+            ]
+        )
 
     def on_mount(self):
         t = self.query_one(DataTable)
-        t.add_column("Nombre")
-        t.add_column("Servidor")
-        t.add_column("Usuario")
+        t.add_column(tr("col_name"))
+        t.add_column(tr("col_server"))
+        t.add_column(tr("col_user"))
         self.reload()
         self.refresh_net()
         t.focus()
+        name = getattr(self.app, "auto_connect", None)
+        if name:  # sshmanager --connect NOMBRE
+            self.app.auto_connect = None
+            self.call_after_refresh(lambda: self.connect_by_name(name))
+
+    def connect_by_name(self, name: str):
+        srv = next((s for s in self.servers if s.get("name", "").lower() == name.lower()), None)
+        if srv is None:
+            self.notify(tr("server_unknown", name=name), severity="error")
+        else:
+            self.connect(srv)
+
+    def action_gui(self):
+        self.app.open_gui(None)
+
+    def servers_saved(self):
+        save_servers(self.servers)
+        link_notify("gui", {"cmd": "servers_changed"})
+        self.reload()
 
     def on_screen_resume(self):
         self.refresh_net()
@@ -1477,14 +1515,15 @@ class ServersScreen(Screen):
             lab = self.query_one("#net", Label)
         except NoMatches:
             return
-        s = self.app.update_status
-        if s.startswith("⚠"):
-            s += "  (u: reintentar)"
-        elif s.startswith("⬆"):
-            s += "  (u: actualizar)"
-        lab.update(Text(s))
-        lab.set_class(s.startswith("⚠"), "warn")
-        lab.set_class(s.startswith("⬆"), "newv")
+        st = self.app.update_status
+        text, kind = "", ""
+        if st and st[0] == "net":
+            text, kind = tr("st_net", e=st[1]) + tr("st_net_retry"), "warn"
+        elif st and st[0] == "new":
+            text, kind = tr("st_new", v=st[1]) + tr("st_new_do"), "newv"
+        lab.update(Text(text))
+        lab.set_class(kind == "warn", "warn")
+        lab.set_class(kind == "newv", "newv")
 
     def reload(self):
         self.servers = load_servers()
@@ -1498,10 +1537,7 @@ class ServersScreen(Screen):
                 key=str(i),
             )
         hint = self.query_one("#hint", Label)
-        if self.servers:
-            hint.update(Text("Servidores guardados — Enter: conectar · n: nuevo · e: editar · x: borrar"))
-        else:
-            hint.update(Text("No hay servidores guardados. Pulsa n para añadir el primero."))
+        hint.update(Text(tr("servers_title") if self.servers else tr("servers_empty")))
 
     def current(self):
         t = self.query_one(DataTable)
@@ -1512,12 +1548,21 @@ class ServersScreen(Screen):
     def action_update(self):
         self.app.push_screen(SplashScreen(manual=True))
 
+    def action_settings(self):
+        def done(result):
+            if result and (result[0] != core.LANG or result[1] != core.CHARS):
+                core.apply_settings(*result)
+                update_scrollbars()
+                self.app.set_class(core.ASCII, "ascii")
+                self.app.switch_screen(ServersScreen())  # se vuelve a dibujar con el idioma nuevo
+
+        self.app.push_screen(SettingsScreen(), done)
+
     def action_new(self):
         def done(v):
             if v:
                 self.servers.append(v)
-                save_servers(self.servers)
-                self.reload()
+                self.servers_saved()
 
         self.app.push_screen(ServerForm(), done)
 
@@ -1529,8 +1574,7 @@ class ServersScreen(Screen):
         def done(v):
             if v:
                 self.servers[i] = v
-                save_servers(self.servers)
-                self.reload()
+                self.servers_saved()
 
         self.app.push_screen(ServerForm(self.servers[i]), done)
 
@@ -1542,10 +1586,9 @@ class ServersScreen(Screen):
         def done(ok):
             if ok:
                 del self.servers[i]
-                save_servers(self.servers)
-                self.reload()
+                self.servers_saved()
 
-        self.app.push_screen(Confirm(f"¿Borrar el servidor '{self.servers[i]['name']}' de la lista?"), done)
+        self.app.push_screen(Confirm(tr("confirm_rm_server", name=self.servers[i]["name"])), done)
 
     # ---- conexión ----
     def on_data_table_row_selected(self, event):
@@ -1555,7 +1598,7 @@ class ServersScreen(Screen):
         if self.connecting:
             return
         self.connecting = True
-        self.notify(f"Conectando a {srv['name']}…")
+        self.notify(tr("connecting", name=srv["name"]))
 
         def job():
             try:
@@ -1578,11 +1621,12 @@ class ServersScreen(Screen):
 
     def _failed(self, srv: dict, msg: str):
         self.connecting = False
-        self.app.report(f"{srv['name']}: {msg}", "error", "No se pudo conectar")
+        self.app.report(f"{srv['name']}: {msg}", "error", tr("connect_fail"))
 
     def _connected(self, conn: Connection, srv: dict):
         self.connecting = False
-        self.app.say(f"Conectado a {srv['name']} ({srv['user']}@{srv['host']}:{srv.get('port', 22)})", "green")
+        addr = f"{srv['user']}@{srv['host']}:{srv.get('port', 22)}"
+        self.app.say(tr("log_connected", name=srv["name"], addr=addr), "green")
         self.app.push_screen(BrowserScreen(conn, srv["name"], srv))
 
     def _need_password(self, srv: dict):
@@ -1592,7 +1636,7 @@ class ServersScreen(Screen):
             if pw:
                 self.connect(srv, pw)
 
-        self.app.push_screen(Ask(f"Contraseña para {srv['user']}@{srv['host']}:", password=True), done)
+        self.app.push_screen(Ask(tr("ask_pass", user=srv["user"], host=srv["host"]), password=True), done)
 
 
 # ─────────────────────────────── Aplicación ───────────────────────────────
@@ -1600,18 +1644,31 @@ class ServersScreen(Screen):
 
 class SSHManager(App):
     TITLE = f"SSH Manager v{__version__}"
+    ENABLE_COMMAND_PALETTE = False
+    # Solo bordes 'solid' y 'double': existen hasta en las fuentes más básicas de Windows.
     CSS = """
-    Panel { width: 1fr; height: 1fr; border: round $primary-darken-1; }
-    Panel:focus-within { border: round $accent; }
+    Screen { background: $surface; }
+    TitleBar { height: 1; width: 100%; background: $primary; color: $text; padding: 0 1; }
+    KeyBar { height: auto; width: 100%; background: $boost; padding: 0 1; }
+    #panels { height: 1fr; }
+    Panel { width: 1fr; height: 1fr; border: solid $primary-darken-2; }
+    Panel:focus-within { border: solid $accent; }
     Panel DataTable { height: 1fr; }
-    .ptitle { text-style: bold; padding: 0 1; }
-    .ppath { color: $text-muted; padding: 0 1; }
-    #status, #hint, #net { height: 1; padding: 0 1; color: $text-muted; }
+    .ptitle { text-style: bold; padding: 0 1; width: 100%; }
+    .ppath { color: $text-muted; padding: 0 1; width: 100%; }
+    #status { height: 1; width: 100%; padding: 0 1; background: $boost; color: $text; }
+    #hint { height: 1; width: 100%; padding: 0 1; text-style: bold; }
+    #net { height: 1; width: 100%; padding: 0 1; }
     #net.warn { color: $error; }
     #net.newv { color: $warning; }
-    ConsoleScreen #hint { color: $text-muted; }
-    #log { height: 1fr; border: round $primary-darken-1; }
-    #cmd { dock: bottom; }
+    #qtable { height: 1fr; }
+    #log { height: 1fr; border: solid $primary-darken-2; }
+    SSHManager.ascii Panel { border: ascii $primary-darken-2; }
+    SSHManager.ascii Panel:focus-within { border: ascii $accent; }
+    SSHManager.ascii #log { border: ascii $primary-darken-2; }
+    SSHManager.ascii .dialog { border: ascii $primary; }
+    SSHManager.ascii Input { border: ascii $primary-darken-2; }
+    SSHManager.ascii Input:focus { border: ascii $accent; }
     SplashScreen { align: center middle; }
     #splash { width: 60; height: auto; }
     #splash Static, #splash Label { width: 100%; text-align: center; }
@@ -1622,22 +1679,102 @@ class SSHManager(App):
     #skiphint { color: $text-muted; margin-top: 1; }
     ModalScreen { align: center middle; }
     .dialog {
-        width: 60; max-width: 95%; height: auto; max-height: 90%;
-        border: thick $primary; background: $surface; padding: 1 2;
+        width: 62; max-width: 95%; height: auto; max-height: 90%;
+        border: double $primary; background: $surface; padding: 1 2;
     }
+    .dialog Label { width: 100%; height: auto; }
     .dialog Input { margin-bottom: 1; }
+    .dialog Button { width: 100%; margin-bottom: 1; }
+    #s_hint { color: $text-muted; margin-bottom: 1; }
     .buttons { height: auto; align-horizontal: right; }
-    .buttons Button { margin-left: 2; }
+    .buttons Button { width: auto; min-width: 12; margin-left: 2; margin-bottom: 0; }
+    /* Campos y botones con bordes simples: los de Textual usan bloques que fallan en Windows */
+    Input { border: solid $primary-darken-2; }
+    Input:focus { border: solid $accent; }
+    Button, Button.-primary, Button.-error, Button.-success, Button.-warning, Button.-default {
+        border: none; height: 1; padding: 0 2; content-align: center middle;
+    }
     """
 
-    def __init__(self):
+    def __init__(self, auto_connect: str | None = None):
         super().__init__()
         self.console_buffer: list = []  # (hora, texto, estilo)
-        self.update_status = ""
+        self.update_status = None  # None | ("net", error) | ("new", versión)
+        self.auto_connect = auto_connect
+        self.current_server = None  # servidor conectado ahora
+        self.gui_online = False
+        self.link = LinkServer("tui", self._link_handler, __version__)
 
     def on_mount(self):
-        self.say(f"SSH Manager v{__version__} iniciado")
+        self.set_class(core.ASCII, "ascii")
+        self.say(tr("log_started", v=__version__))
+        self.link.start()
+        self.set_interval(3.0, self._poll_link)
         self.push_screen(SplashScreen())
+
+    def on_unmount(self):
+        self.link.stop()
+
+    # ---- enlace con la app gráfica ----
+    def _poll_link(self):
+        self.run_worker(lambda: self.call_from_thread(self._set_link, link_alive("gui")), thread=True, group="link", exclusive=True)
+
+    def _set_link(self, online: bool):
+        self.gui_online = online
+        for scr in list(self.screen_stack):
+            for bar in scr.query(TitleBar):
+                bar.set_link(online)
+
+    def open_gui(self, server: str | None):
+        def job():
+            ok, msg = core.launch_gui(server)
+            self.call_from_thread(self.report, msg, "information" if ok else "warning")
+
+        self.run_worker(job, thread=True, group="gui")
+
+    def _link_handler(self, msg: dict):
+        """Mensajes de la app gráfica (llegan en otro hilo)."""
+        cmd = msg.get("cmd")
+
+        def run(fn):
+            try:
+                self.call_from_thread(fn)
+            except Exception:  # noqa: BLE001  (la app se está cerrando)
+                pass
+
+        if cmd == "info":
+            return {"ok": True, "kind": "tui", "version": __version__, "server": self.current_server}
+        if cmd == "servers_changed":
+            run(self._link_servers)
+            return {"ok": True}
+        if cmd == "queue_changed":
+            run(lambda: self._link_queue(msg.get("key")))
+            return {"ok": True}
+        if cmd == "open_server":
+            name = str(msg.get("name", ""))
+            if not find_server(name):
+                return {"ok": False, "error": "unknown server"}
+            run(lambda: self._link_open(name))
+            return {"ok": True}
+        return {"ok": False, "error": "unknown command"}
+
+    def _link_servers(self):
+        for scr in list(self.screen_stack):
+            if isinstance(scr, ServersScreen):
+                scr.reload()
+                self.say(tr("link_servers"))
+
+    def _link_queue(self, key):
+        for scr in list(self.screen_stack):
+            if isinstance(scr, BrowserScreen) and scr.qkey == key:
+                scr.queue_reload()
+
+    def _link_open(self, name: str):
+        self.say(tr("link_open", name=name))
+        if isinstance(self.screen, ServersScreen):
+            self.screen.connect_by_name(name)
+        else:
+            self.notify(tr("link_open", name=name), severity="warning")
 
     # ---- consola de eventos ----
     def say(self, text: str, style: str = ""):
@@ -1663,27 +1800,9 @@ class SSHManager(App):
 
 
 def main():
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
     args = sys.argv[1:]
-    if args:
-        a = args[0]
-        if a in ("-h", "--help"):
-            print(MANUAL)
-            return
-        if a in ("-v", "--version"):
-            print(f"SSH Manager v{__version__}")
-            return
-        if a in ("-u", "--update"):
-            sys.exit(cli_update())
-        if a in ("-d", "--delete", "--uninstall"):
-            sys.exit(cli_uninstall())
-        print(f"Opción desconocida: {a}\n\nUsa: sshmanager -h")
-        sys.exit(2)
-    SSHManager().run()
+    connect = args[1] if len(args) > 1 and args[0] == "--connect" else None
+    SSHManager(auto_connect=connect).run()
 
 
 if __name__ == "__main__":
