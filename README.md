@@ -57,16 +57,16 @@ Haz clic con el botón derecho dentro de la carpeta y busca una opción como "Ab
 
 Opción 2 — desde una terminal:
 Abre tu aplicación Terminal y utiliza cd para entrar en la carpeta. Por ejemplo, si la carpeta está dentro de `Descargas`:
-`cd ~/Descargas/SSHManager`
+```cd ~/Descargas/SSHManager```
 Puedes comprobar que estás en la carpeta correcta ejecutando:
-`ls`
+```ls```
 Deberías ver:
 `instalar_linux.sh`
 `sshmanager.py`
 Después, dale permisos de ejecución al instalador:
-`chmod +x instalar_linux.sh`
+```chmod +x instalar_linux.sh```
 Y ejecútalo con:
-`./instalar_linux.sh`
+```./instalar_linux.sh```
 Sigue las instrucciones que aparezcan en la terminal hasta que finalice la instalación.
 
 ### 5. Importante
@@ -139,11 +139,11 @@ Option 2 — From a terminal:
 
 Open your Terminal application and use `cd` to navigate to the folder. For example, if the folder is inside `Downloads`:
 
-`cd ~/Downloads/SSHManager`
+```cd ~/Downloads/SSHManager```
 
 You can check that you are in the correct folder by running:
 
-`ls`
+```ls```
 
 You should see:
 
@@ -153,11 +153,11 @@ You should see:
 
 Next, grant execution permissions to the installer:
 
-`chmod +x instalar_linux.sh`
+```chmod +x instalar_linux.sh```
 
 Then run it with:
 
-`./instalar_linux.sh`
+```./instalar_linux.sh```
 
 Follow the instructions displayed in the terminal until the installation is complete.
 
